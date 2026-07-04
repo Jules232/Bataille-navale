@@ -2,7 +2,7 @@
 <html lang="fr">
 <head>
 <meta charset="UTF-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
 <meta name="description" content="Projet Trident — Bataille Navale en ligne. Affrontez un adversaire en multijoueur ou contre l'IA sur une carte tactique, stratégique ou océanique." />
 <meta name="theme-color" content="#020b14" />
 <title>Projet Trident — Bataille Navale en ligne</title>
@@ -10,7 +10,7 @@
 <!-- Tailwind CSS (utility classes utilisées dans toute l'interface) -->
 <script src="https://cdn.tailwindcss.com"></script>
 
-<!-- Carte d'imports : permet au code source de garder ses imports ("react", "firebase/app", "lucide-react", ...) inchangés -->
+<!-- Carte d'imports : permet au code source de garder ses imports inchangés -->
 <script type="importmap">
 {
   "imports": {
@@ -36,6 +36,7 @@
     min-height: 100%;
     overflow-x: hidden;
     -webkit-text-size-adjust: 100%;
+    overscroll-behavior-y: none; /* Empêche le pull-to-refresh accidentel sur mobile */
   }
   body {
     background-color: #020b14;
@@ -88,7 +89,7 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { initializeApp } from 'firebase/app';
 import { getAuth, signInAnonymously, onAuthStateChanged, signInWithCustomToken } from 'firebase/auth';
-import { getFirestore, collection, doc, setDoc, updateDoc, onSnapshot, getDocs, deleteDoc } from 'firebase/firestore';
+import { getFirestore, collection, doc, setDoc, updateDoc, onSnapshot, getDocs, getDoc, deleteDoc } from 'firebase/firestore';
 import { Crosshair, Zap, Anchor, RotateCw, Play, Search, Target, ShieldQuestion, ShieldAlert, Waves, Map, Flame, Info, X, Circle } from 'lucide-react';
 import { createRoot } from 'react-dom/client';
 
@@ -195,7 +196,7 @@ export default function BatailleNavale() {
         return () => unsubscribe();
     }, []);
 
-    // 2. Synchronisation Firebase (Multiplayer)
+    // 2. Synchronisation Firebase (Multiplayer) - Optimisée sans gameState dans les dépendances
     useEffect(() => {
         if (!user || gameMode !== 'ONLINE' || !gameId) return;
 
@@ -204,15 +205,28 @@ export default function BatailleNavale() {
             if (docSnap.exists()) {
                 const data = docSnap.data();
                 
-                if (gameState === 'MATCHMAKING' && data.player2) {
-                    setMapSize(data.mapSize);
-                    setGameState('PLACEMENT');
-                    initPlacement(data.fleetMode);
-                }
+                setMapSize(data.mapSize);
                 
-                if (gameState === 'WAITING_OPPONENT' && data.p1Ready && data.p2Ready) {
+                setGameState(prev => {
+                    if (prev === 'MATCHMAKING' && data.player2) {
+                        const lengths = FLEET_MODES[data.fleetMode].ships;
+                        setShipsToPlace(lengths.map((len, i) => ({ id: i, length: len })));
+                        setCurrentShipIndex(0);
+                        setMyShips([]);
+                        setPlacementDir('H');
+                        return 'PLACEMENT';
+                    }
+                    if (prev === 'WAITING_OPPONENT' && data.p1Ready && data.p2Ready) {
+                        return 'PLAYING';
+                    }
+                    if (data.winner && prev !== 'FINISHED') {
+                        return 'FINISHED';
+                    }
+                    return prev;
+                });
+
+                if (data.p1Ready && data.p2Ready) {
                     setOpponentShips(playerNum === 1 ? data.p2Ships : data.p1Ships);
-                    setGameState('PLAYING');
                 }
 
                 if (data.status === 'playing' || data.status === 'finished') {
@@ -222,19 +236,29 @@ export default function BatailleNavale() {
                     
                     if (data.winner) {
                         setWinner(data.winner);
-                        setGameState('FINISHED');
                     }
                 }
             } else {
-                // Le document a été supprimé (ex: adversaire a quitté pendant le matchmaking)
-                if (gameState !== 'FINISHED' && gameState !== 'MENU') {
-                    resetToMenu();
-                }
+                // Le document a été supprimé (ex: adversaire a quitté)
+                setGameState(prev => {
+                    if (prev !== 'FINISHED' && prev !== 'MENU') {
+                        setGameId(null);
+                        setMyShips([]);
+                        setMyShots([]);
+                        setOpponentShips([]);
+                        setOpponentShots([]);
+                        setRadarCharges(0);
+                        setIsRadarActive(false);
+                        setBotLastHits([]);
+                        return 'MENU';
+                    }
+                    return prev;
+                });
             }
         }, (err) => console.error("Erreur de synchronisation réseau:", err));
 
         return () => unsubscribe();
-    }, [user, gameId, gameMode, gameState, playerNum]);
+    }, [user, gameId, gameMode, playerNum]);
 
     // 3. IA : Obtenir la cible du bot
     const getBotTarget = useCallback(() => {
@@ -252,8 +276,6 @@ export default function BatailleNavale() {
             if (unshotNeighbors.length > 0) {
                 return unshotNeighbors[Math.floor(Math.random() * unshotNeighbors.length)];
             }
-            // Si le bot est bloqué (côté de carte ou tous les voisins tirés), on ne vide pas la pile ici,
-            // on passe au tir aléatoire qui finira par tomber juste. La vraie pile se vide quand le navire est coulé.
         }
         
         // Tir aléatoire
@@ -403,12 +425,10 @@ export default function BatailleNavale() {
             const updateData = playerNum === 1 ? { p1Ships: myShips, p1Ready: true } : { p2Ships: myShips, p2Ready: true };
             await updateDoc(gameRef, updateData);
             
-            // Résolution des conditions de départ via transaction locale simplifiée
-            const snap = await getDocs(collection(db, 'artifacts', appId, 'public', 'data', 'games'));
-            let currentDoc = null;
-            snap.forEach(d => { if(d.id === gameId) currentDoc = d.data(); });
-            
-            if (currentDoc) {
+            // Résolution des conditions de départ via document direct pour performances optimisées
+            const docSnap = await getDoc(gameRef);
+            if (docSnap.exists()) {
+                const currentDoc = docSnap.data();
                 if ((playerNum === 1 && currentDoc.p2Ready) || (playerNum === 2 && currentDoc.p1Ready)) {
                     await updateDoc(gameRef, { status: 'playing' });
                 }
@@ -579,27 +599,32 @@ export default function BatailleNavale() {
         const shots = isMyGrid ? opponentShots : myShots;
         const ships = isMyGrid ? myShips : opponentShips;
 
+        // Optimisation majeure : Pré-calcul des positions O(N) pour éviter la boucle imbriquée coûteuse O(N^2)
+        const shotMap = {};
+        shots.forEach(s => { shotMap[`${s.x}-${s.y}`] = s; });
+
+        const shipMap = {};
+        if (isMyGrid || gameState === 'FINISHED') {
+            ships.forEach(s => {
+                for (let i = 0; i < s.length; i++) {
+                    let sx = s.direction === 'H' ? s.x + i : s.x;
+                    let sy = s.direction === 'V' ? s.y + i : s.y;
+                    shipMap[`${sx}-${sy}`] = true;
+                }
+            });
+        }
+
         for (let y = 0; y < mapSize; y++) {
             for (let x = 0; x < mapSize; x++) {
-                let isShip = false;
+                const isShip = shipMap[`${x}-${y}`];
+                const shot = shotMap[`${x}-${y}`];
                 
-                if (isMyGrid || gameState === 'FINISHED') {
-                    ships.forEach(s => {
-                        for (let i = 0; i < s.length; i++) {
-                            let sx = s.direction === 'H' ? s.x + i : s.x;
-                            let sy = s.direction === 'V' ? s.y + i : s.y;
-                            if (sx === x && sy === y) isShip = true;
-                        }
-                    });
-                }
-
-                const shot = shots.find(s => s.x === x && s.y === y);
-                let bgClass = "bg-transparent border-[0.5px] border-cyan-900/40 hover:bg-cyan-500/20 cursor-crosshair transition-all duration-200";
+                let bgClass = "bg-transparent border-[0.5px] border-cyan-900/40 hover:bg-cyan-500/20 cursor-crosshair transition-all duration-200 touch-manipulation select-none";
                 
-                if (isMyGrid && isShip) bgClass = "bg-cyan-600/80 shadow-[0_0_8px_rgba(0,255,255,0.4)] border-cyan-400";
+                if (isShip) bgClass = "bg-cyan-600/80 shadow-[0_0_8px_rgba(0,255,255,0.4)] border-cyan-400 touch-manipulation select-none";
                 if (shot) {
-                    if (shot.status === 'hit') bgClass = "bg-red-500/90 shadow-[0_0_15px_rgba(255,0,0,0.8)] border-red-400 animate-pulse z-10";
-                    else bgClass = "bg-blue-400/30 backdrop-blur-sm border-blue-300/50";
+                    if (shot.status === 'hit') bgClass = "bg-red-500/90 shadow-[0_0_15px_rgba(255,0,0,0.8)] border-red-400 animate-pulse z-10 touch-manipulation select-none";
+                    else bgClass = "bg-blue-400/30 backdrop-blur-sm border-blue-300/50 touch-manipulation select-none";
                 }
 
                 if (!isMyGrid && isRadarActive && radarGlow?.x === x && radarGlow?.y === y) {
@@ -635,42 +660,41 @@ export default function BatailleNavale() {
 
     const renderPlacementGrid = () => {
         const grid = [];
+        
+        // Optimisation du pré-calcul pour le placement
+        const shipMap = {};
+        myShips.forEach(s => {
+            for (let i = 0; i < s.length; i++) {
+                let sx = s.direction === 'H' ? s.x + i : s.x;
+                let sy = s.direction === 'V' ? s.y + i : s.y;
+                shipMap[`${sx}-${sy}`] = true;
+            }
+        });
+
+        const previewMap = {};
+        let isHoverValid = false;
+        
+        if (hoverPos && currentShipIndex < shipsToPlace.length) {
+            const currentShip = shipsToPlace[currentShipIndex];
+            isHoverValid = isPlacementValid(hoverPos.x, hoverPos.y, currentShip.length, placementDir, myShips);
+            for (let i = 0; i < currentShip.length; i++) {
+                let sx = placementDir === 'H' ? hoverPos.x + i : hoverPos.x;
+                let sy = placementDir === 'V' ? hoverPos.y + i : hoverPos.y;
+                previewMap[`${sx}-${sy}`] = true;
+            }
+        }
+
         for (let y = 0; y < mapSize; y++) {
             for (let x = 0; x < mapSize; x++) {
-                let isShip = false;
-                myShips.forEach(s => {
-                    for (let i = 0; i < s.length; i++) {
-                        let sx = s.direction === 'H' ? s.x + i : s.x;
-                        let sy = s.direction === 'V' ? s.y + i : s.y;
-                        if (sx === x && sy === y) isShip = true;
-                    }
-                });
-
-                let isHoverValid = false;
-                let isHoverInvalid = false;
+                const isShip = shipMap[`${x}-${y}`];
+                const inPreview = previewMap[`${x}-${y}`];
                 
-                if (hoverPos && currentShipIndex < shipsToPlace.length) {
-                    const currentShip = shipsToPlace[currentShipIndex];
-                    let inPreview = false;
-                    for (let i = 0; i < currentShip.length; i++) {
-                        let sx = placementDir === 'H' ? hoverPos.x + i : hoverPos.x;
-                        let sy = placementDir === 'V' ? hoverPos.y + i : hoverPos.y;
-                        if (sx === x && sy === y) inPreview = true;
-                    }
-
-                    if (inPreview) {
-                        if (isPlacementValid(hoverPos.x, hoverPos.y, currentShip.length, placementDir, myShips)) {
-                            isHoverValid = true;
-                        } else {
-                            isHoverInvalid = true;
-                        }
-                    }
+                let bgClass = "bg-transparent border-[0.5px] border-cyan-900/40 cursor-pointer hover:bg-cyan-900/30 transition-colors touch-manipulation select-none";
+                if (isShip) bgClass = "bg-cyan-600/80 shadow-[0_0_8px_rgba(0,255,255,0.4)] border-cyan-400 z-10 touch-manipulation select-none";
+                else if (inPreview) {
+                    if (isHoverValid) bgClass = "bg-green-500/60 shadow-[0_0_10px_rgba(0,255,0,0.5)] z-20 touch-manipulation select-none";
+                    else bgClass = "bg-red-500/60 shadow-[0_0_10px_rgba(255,0,0,0.5)] z-20 touch-manipulation select-none";
                 }
-
-                let bgClass = "bg-transparent border-[0.5px] border-cyan-900/40 cursor-pointer hover:bg-cyan-900/30 transition-colors";
-                if (isShip) bgClass = "bg-cyan-600/80 shadow-[0_0_8px_rgba(0,255,255,0.4)] border-cyan-400 z-10";
-                else if (isHoverValid) bgClass = "bg-green-500/60 shadow-[0_0_10px_rgba(0,255,0,0.5)] z-20";
-                else if (isHoverInvalid) bgClass = "bg-red-500/60 shadow-[0_0_10px_rgba(255,0,0,0.5)] z-20";
 
                 grid.push(
                     <div 
@@ -734,7 +758,7 @@ export default function BatailleNavale() {
                     </h1>
                 </div>
                 {gameState !== 'MENU' && (
-                    <button onClick={resetToMenu} className="text-[10px] sm:text-xs uppercase tracking-wider font-bold px-3 py-2 sm:px-4 sm:py-2 bg-red-950/40 text-red-400 hover:bg-red-900/60 border border-red-900/50 rounded-md transition-all shadow-[0_0_10px_rgba(255,0,0,0.1)] whitespace-nowrap">
+                    <button onClick={resetToMenu} className="text-[10px] sm:text-xs uppercase tracking-wider font-bold px-3 py-2 sm:px-4 sm:py-2 bg-red-950/40 text-red-400 hover:bg-red-900/60 border border-red-900/50 rounded-md transition-all shadow-[0_0_10px_rgba(255,0,0,0.1)] whitespace-nowrap touch-manipulation">
                         Abandonner
                     </button>
                 )}
@@ -753,14 +777,14 @@ export default function BatailleNavale() {
                                 <label className="block text-[10px] sm:text-xs font-bold text-cyan-600 mb-2 uppercase tracking-widest">Type d'Engagement</label>
                                 <div className="grid grid-cols-2 gap-2 sm:gap-3">
                                     <button 
-                                        className={`py-3 sm:py-4 rounded-xl flex flex-col items-center gap-2 border transition-all ${gameMode === 'ONLINE' ? 'border-cyan-400 bg-cyan-900/30 text-cyan-300 shadow-[0_0_15px_rgba(0,255,255,0.2)]' : 'border-slate-800 bg-slate-900/50 text-slate-500 hover:border-slate-700'}`}
+                                        className={`py-3 sm:py-4 rounded-xl flex flex-col items-center gap-2 border transition-all touch-manipulation ${gameMode === 'ONLINE' ? 'border-cyan-400 bg-cyan-900/30 text-cyan-300 shadow-[0_0_15px_rgba(0,255,255,0.2)]' : 'border-slate-800 bg-slate-900/50 text-slate-500 hover:border-slate-700'}`}
                                         onClick={() => setGameMode('ONLINE')}
                                     >
                                         <Zap size={20} className="sm:w-6 sm:h-6" />
                                         <span className="text-xs sm:text-sm font-bold uppercase text-center leading-tight">Multijoueur</span>
                                     </button>
                                     <button 
-                                        className={`py-3 sm:py-4 rounded-xl flex flex-col items-center gap-2 border transition-all ${gameMode === 'BOT' ? 'border-emerald-400 bg-emerald-900/30 text-emerald-300 shadow-[0_0_15px_rgba(16,185,129,0.2)]' : 'border-slate-800 bg-slate-900/50 text-slate-500 hover:border-slate-700'}`}
+                                        className={`py-3 sm:py-4 rounded-xl flex flex-col items-center gap-2 border transition-all touch-manipulation ${gameMode === 'BOT' ? 'border-emerald-400 bg-emerald-900/30 text-emerald-300 shadow-[0_0_15px_rgba(16,185,129,0.2)]' : 'border-slate-800 bg-slate-900/50 text-slate-500 hover:border-slate-700'}`}
                                         onClick={() => setGameMode('BOT')}
                                     >
                                         <ShieldAlert size={20} className="sm:w-6 sm:h-6" />
@@ -774,7 +798,7 @@ export default function BatailleNavale() {
                                     <Map size={14}/> Zone de Combat
                                 </label>
                                 <select 
-                                    className="w-full bg-[#030d1c] border border-cyan-900/50 text-cyan-100 rounded-lg p-3 outline-none focus:border-cyan-500 transition-colors cursor-pointer appearance-none text-sm sm:text-base"
+                                    className="w-full bg-[#030d1c] border border-cyan-900/50 text-cyan-100 rounded-lg p-3 outline-none focus:border-cyan-500 transition-colors cursor-pointer appearance-none text-sm sm:text-base touch-manipulation"
                                     value={mapSize}
                                     onChange={(e) => setMapSize(Number(e.target.value))}
                                 >
@@ -787,7 +811,7 @@ export default function BatailleNavale() {
                             <div>
                                 <label className="block text-[10px] sm:text-xs font-bold text-cyan-600 mb-2 uppercase tracking-widest">Taille de la flotte</label>
                                 <select 
-                                    className="w-full bg-[#030d1c] border border-cyan-900/50 text-cyan-100 rounded-lg p-3 outline-none focus:border-cyan-500 transition-colors cursor-pointer appearance-none text-sm sm:text-base"
+                                    className="w-full bg-[#030d1c] border border-cyan-900/50 text-cyan-100 rounded-lg p-3 outline-none focus:border-cyan-500 transition-colors cursor-pointer appearance-none text-sm sm:text-base touch-manipulation"
                                     value={fleetMode}
                                     onChange={(e) => setFleetMode(e.target.value)}
                                 >
@@ -799,7 +823,7 @@ export default function BatailleNavale() {
 
                             <button 
                                 onClick={startGame}
-                                className="w-full py-3 sm:py-4 mt-2 sm:mt-4 bg-cyan-600 hover:bg-cyan-500 text-[#010812] font-black uppercase tracking-widest rounded-xl shadow-[0_0_20px_rgba(0,255,255,0.4)] flex items-center justify-center gap-2 transition-all transform hover:scale-[1.02] active:scale-95 text-sm sm:text-base"
+                                className="w-full py-3 sm:py-4 mt-2 sm:mt-4 bg-cyan-600 hover:bg-cyan-500 text-[#010812] font-black uppercase tracking-widest rounded-xl shadow-[0_0_20px_rgba(0,255,255,0.4)] flex items-center justify-center gap-2 transition-all transform hover:scale-[1.02] active:scale-95 text-sm sm:text-base touch-manipulation"
                             >
                                 <Play size={20} fill="currentColor" />
                                 Déployer
@@ -822,7 +846,7 @@ export default function BatailleNavale() {
                             <p>Map: {mapSize}x{mapSize} | Flotte: {FLEET_MODES[fleetMode].name}</p>
                             <p className="mt-2 animate-pulse">En attente d'un adversaire</p>
                         </div>
-                        <button onClick={cancelMatchmaking} className="mt-2 sm:mt-4 px-6 py-2 sm:px-8 sm:py-3 text-[10px] sm:text-xs uppercase tracking-widest font-bold border border-cyan-800 text-cyan-600 rounded-full hover:bg-cyan-950/50 transition">
+                        <button onClick={cancelMatchmaking} className="mt-2 sm:mt-4 px-6 py-2 sm:px-8 sm:py-3 text-[10px] sm:text-xs uppercase tracking-widest font-bold border border-cyan-800 text-cyan-600 rounded-full hover:bg-cyan-950/50 transition touch-manipulation">
                             Interrompre
                         </button>
                     </div>
@@ -858,7 +882,7 @@ export default function BatailleNavale() {
                                     
                                     <button 
                                         onClick={() => setPlacementDir(d => d === 'H' ? 'V' : 'H')}
-                                        className="flex items-center justify-center gap-2 sm:gap-3 w-full py-3 sm:py-4 bg-cyan-950/40 hover:bg-cyan-900/60 border border-cyan-800 text-cyan-300 rounded-xl transition font-bold uppercase tracking-widest text-xs sm:text-sm"
+                                        className="flex items-center justify-center gap-2 sm:gap-3 w-full py-3 sm:py-4 bg-cyan-950/40 hover:bg-cyan-900/60 border border-cyan-800 text-cyan-300 rounded-xl transition font-bold uppercase tracking-widest text-xs sm:text-sm touch-manipulation"
                                     >
                                         <RotateCw size={18} className="shrink-0" />
                                         Axe: {placementDir === 'H' ? 'Horiz.' : 'Vertical'}
@@ -873,7 +897,7 @@ export default function BatailleNavale() {
                                     <h3 className="text-base sm:text-lg font-bold text-emerald-400 uppercase tracking-widest">Formation Prête</h3>
                                     <button 
                                         onClick={validatePlacement}
-                                        className="w-full py-3 sm:py-4 mt-2 sm:mt-4 bg-emerald-600 hover:bg-emerald-500 text-[#010812] font-black uppercase tracking-widest text-xs sm:text-sm rounded-xl shadow-[0_0_20px_rgba(16,185,129,0.4)] transition-all"
+                                        className="w-full py-3 sm:py-4 mt-2 sm:mt-4 bg-emerald-600 hover:bg-emerald-500 text-[#010812] font-black uppercase tracking-widest text-xs sm:text-sm rounded-xl shadow-[0_0_20px_rgba(16,185,129,0.4)] transition-all touch-manipulation"
                                     >
                                         Valider Coordonnées
                                     </button>
@@ -918,7 +942,7 @@ export default function BatailleNavale() {
                                 <button 
                                     onClick={activateRadar}
                                     disabled={radarCharges === 0 || isRadarActive || currentTurn !== playerNum || gameState === 'FINISHED'}
-                                    className={`relative flex items-center justify-center w-10 h-10 sm:w-12 sm:h-12 rounded-full border-2 transition-all overflow-hidden shrink-0
+                                    className={`relative flex items-center justify-center w-10 h-10 sm:w-12 sm:h-12 rounded-full border-2 transition-all overflow-hidden shrink-0 touch-manipulation
                                         ${isRadarActive ? 'border-yellow-400 bg-yellow-400/20 shadow-[0_0_20px_rgba(250,204,21,0.5)]' 
                                         : radarCharges > 0 && currentTurn === playerNum ? 'border-yellow-500 bg-yellow-950/40 hover:bg-yellow-900/60 cursor-pointer shadow-[0_0_10px_rgba(250,204,21,0.2)]'
                                         : 'border-slate-800 bg-slate-900 opacity-50 cursor-not-allowed'}`}
@@ -979,7 +1003,7 @@ export default function BatailleNavale() {
                                     Votre objectif est de couler toute la flotte adverse. Sélectionnez une case sur le <b>Secteur Hostile</b> pour tirer. 
                                 </p>
                             </div>
-                            <div className="flex flex-col sm:flex-row gap-4 sm:gap-6 bg-[#020b14] p-4 rounded-xl border border-cyan-900/30 shrink-0">
+                            <div className="flex flex-col sm:flex-row gap-4 sm:gap-6 bg-[#020b14] p-4 rounded-xl border border-cyan-900/30 shrink-0 select-none">
                                 <div className="flex items-center gap-3">
                                     <X size={20} className="text-green-500" strokeWidth={4} />
                                     <span className="text-xs text-slate-300 font-mono">Navire Ennemi Touché</span>
@@ -1020,7 +1044,7 @@ export default function BatailleNavale() {
                                     )}
                                     <button 
                                         onClick={resetToMenu}
-                                        className="w-full py-3 sm:py-4 bg-transparent border border-cyan-600 text-cyan-400 hover:bg-cyan-900/30 font-black uppercase tracking-widest text-sm sm:text-base rounded-xl transition-colors relative z-10"
+                                        className="w-full py-3 sm:py-4 bg-transparent border border-cyan-600 text-cyan-400 hover:bg-cyan-900/30 font-black uppercase tracking-widest text-sm sm:text-base rounded-xl transition-colors relative z-10 touch-manipulation"
                                     >
                                         Retour Base
                                     </button>
